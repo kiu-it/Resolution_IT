@@ -1,0 +1,18 @@
+{
+  "name": "minh-tin-tech-services",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Website dịch vụ sửa chữa và triển khai hạ tầng công nghệ",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "nodemailer": "^10.5.0"
+  }
+}
