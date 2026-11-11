@@ -388,6 +388,12 @@ export function createApp({
   });
 }
 
+const vercelApp = createApp();
+
+export default function vercelHandler(request, response) {
+  vercelApp.emit("request", request, response);
+}
+
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const server = createApp();
   const port = Number(process.env.PORT) || 3000;

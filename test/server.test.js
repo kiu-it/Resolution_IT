@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import { createApp } from "../server.js";
+import vercelHandler, { createApp } from "../server.js";
 
 let server;
 let dataDirectory;
@@ -49,6 +49,28 @@ test("returns the available services", async () => {
   assert.equal(response.status, 200);
   assert.equal(body.services.length, 6);
   assert.ok(body.services.some((service) => service.id === "security-camera"));
+});
+
+test("exports a Vercel-compatible handler for API requests", async () => {
+  const response = await new Promise((resolve) => {
+    const result = { headers: {} };
+    vercelHandler(
+      { method: "GET", url: "/api/services", headers: {} },
+      {
+        writeHead(statusCode, headers) {
+          result.statusCode = statusCode;
+          result.headers = headers;
+        },
+        end(body) {
+          result.body = JSON.parse(body);
+          resolve(result);
+        }
+      }
+    );
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.services.length, 6);
 });
 
 test("validates and stores a service request", async () => {
