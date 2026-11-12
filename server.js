@@ -1,16 +1,32 @@
+import "dotenv/config";
 import { createServer as createHttpServer } from "node:http";
-import { appendFile, readFile, stat } from "node:fs/promises";
+import { appendFile, mkdir, readFile, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, extname, join, normalize, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import nodemailer from "nodemailer";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = join(ROOT, "public");
-const DATA_FILE = process.env.DATA_FILE || join(ROOT, "data", "requests.jsonl");
+const DATA_FILE =
+  process.env.DATA_FILE ||
+  (process.env.VERCEL
+    ? join(tmpdir(), "kiu-tech", "requests.jsonl")
+    : join(ROOT, "data", "requests.jsonl"));
 const REQUEST_EMAIL = "dungocanh061003@gmail.com";
 const MAX_BODY_BYTES = 16_384;
 const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
 const RATE_LIMIT_MAX_REQUESTS = 10;
+const EMAIL_RETRY_ATTEMPTS = 3;
+const EMAIL_RETRY_DELAY_MS = 250;
+const RETRYABLE_EMAIL_ERROR_CODES = new Set([
+  "ECONNECTION",
+  "ECONNRESET",
+  "EDNS",
+  "EAI_AGAIN",
+  "ESOCKET",
+  "ETIMEDOUT"
+]);
 
 const SERVICES = [
   {
@@ -133,7 +149,7 @@ function validateRequest(input) {
     return { error: "Vui lòng chọn dịch vụ cần tư vấn." };
   }
 
-  if (email && (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) {
+  if (!email || email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return { error: "Địa chỉ email chưa đúng định dạng." };
   }
 
@@ -165,9 +181,11 @@ function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (character) => entities[character]);
 }
 
-function createRequestMailer() {
-  const user = process.env.SMTP_USER;
-  const password = process.env.SMTP_APP_PASSWORD;
+export function createRequestMailer({
+  user = process.env.SMTP_USER,
+  password = process.env.SMTP_APP_PASSWORD,
+  createTransport = nodemailer.createTransport
+} = {}) {
 
   if (!user || !password) {
     return async () => {
@@ -177,10 +195,8 @@ function createRequestMailer() {
     };
   }
 
-  const transporter = nodemailer.createTransport({
-    host: "smtp.gmail.com",
-    port: 465,
-    secure: true,
+  const transporter = createTransport({
+    service: "gmail",
     auth: { user, pass: password },
     connectionTimeout: 10_000,
     greetingTimeout: 10_000,
@@ -200,11 +216,15 @@ function createRequestMailer() {
     ];
 
     await transporter.sendMail({
-      from: { name: "Minh Tín Tech", address: user },
+      from: { name: "Website", address: user },
       to: REQUEST_EMAIL,
-      replyTo: request.email || undefined,
-      subject: `[KIUTECH] Yêu cầu tư vấn - ${service.title}`,
-      text: details.map(([label, value]) => `${label}: ${value}`).join("\n"),
+      cc: request.email,
+      replyTo: request.email,
+      subject: `Yêu cầu mới #${request.id} - ${service.title}`,
+      text:
+        `Mã: ${request.id}\nDịch vụ: ${service.title}\nHọ tên: ${request.name}\n` +
+        `SĐT: ${request.phone}\nEmail: ${request.email}\n` +
+        `Thời gian: ${request.createdAt}\n\n${request.message || "Không cung cấp"}`,
       html: `<h2>Yêu cầu tư vấn dịch vụ mới</h2><table>${details
         .map(
           ([label, value]) =>
@@ -213,6 +233,40 @@ function createRequestMailer() {
         .join("")}</table>`
     });
   };
+}
+
+function isRetryableEmailError(error) {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  if (error.statusCode === 503 || error.code === "EAUTH" || error.code === "EENVELOPE") {
+    return false;
+  }
+
+  const responseCode = Number(error.responseCode);
+  if (Number.isInteger(responseCode)) {
+    return responseCode >= 400 && responseCode < 500;
+  }
+
+  return RETRYABLE_EMAIL_ERROR_CODES.has(error.code);
+}
+
+async function sendEmailWithRetry(sendEmail, request) {
+  for (let attempt = 1; attempt <= EMAIL_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      await sendEmail(request);
+      return;
+    } catch (error) {
+      if (attempt === EMAIL_RETRY_ATTEMPTS || !isRetryableEmailError(error)) {
+        throw error;
+      }
+
+      await new Promise((resolve) =>
+        setTimeout(resolve, EMAIL_RETRY_DELAY_MS * 2 ** (attempt - 1))
+      );
+    }
+  }
 }
 
 function createRateLimiter() {
@@ -315,12 +369,13 @@ export function createApp({
           return;
         }
 
+        await mkdir(dirname(dataFile), { recursive: true });
         await appendFile(dataFile, `${JSON.stringify(result.value)}\n`, {
           encoding: "utf8",
           flag: "a"
         });
         try {
-          await sendEmail(result.value);
+          await sendEmailWithRetry(sendEmail, result.value);
         } catch (error) {
           const statusCode = error.statusCode === 503 ? 503 : 502;
           console.error(
@@ -345,7 +400,10 @@ export function createApp({
           sendJson(response, error.statusCode, { error: error.message });
           return;
         }
-        console.error("Could not save service request:", error);
+        console.error(
+          "Could not save service request:",
+          error.code || error.message
+        );
         sendJson(response, 500, {
           error: "Chưa thể lưu yêu cầu lúc này. Vui lòng thử lại sau."
         });
@@ -398,6 +456,6 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const server = createApp();
   const port = Number(process.env.PORT) || 3000;
   server.listen(port, () => {
-    console.log(`Minh Tín Tech is running at http://localhost:${port}`);
+    console.log(`Kiu Tech is running at http://localhost:${port}`);
   });
 }
